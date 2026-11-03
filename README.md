@@ -7,14 +7,17 @@
 ## Key findings
 Scope: 50 top-selling food SKUs at Walmart store CA_1. Backtested on the last 26 weeks (Nov 2015 to May 2016), which the model never saw during training or tuning.
 
-1. **LightGBM cut forecast error to 20.3% WAPE**, against 22.3% for last-week naive and 23.4% for a 4-week moving average. That is a 9% relative improvement, with almost no bias (-0.4%).
+1. **The tuned LightGBM model cut forecast error to 20.1% WAPE**, against 22.3% for last-week naive and 23.4% for a 4-week moving average. That is a 10% relative improvement, with little bias (-1.2%).
 2. **Better forecasts mean less safety stock.** To serve 98% of demand, the LightGBM-driven policy needs **$9.3k of average inventory, against $10.9k for the best simple method (15% less) and $12.0k for naive (22% less)**.
 3. **Seasonal naive (same week last year) is a poor choice here.** It has 45% error and needs more than twice the inventory, because grocery demand shifts too much year to year.
-4. **Recent sales and seasonality drive the model.** The top features are last week's sales, sales 52 weeks ago, week of year and recent volatility.
+4. **Last week's sales drive the forecast; price barely matters.** SHAP values show last week's sales move a prediction by 39 units on average, far more than anything else. Which product it is (9), sales a year ago (3.5) and SNAP benefit days (2.1) come next. Price changes have almost no effect for these staple foods.
+5. **Hyperparameter tuning helped only a little.** Optuna's best settings improved cross-validated error from 23.0% to 22.5% and test error from 20.3% to 20.1%. The default model was already close to optimal; better data (see Limitations) would likely help more than more tuning.
 
 | | |
 |---|---|
 | ![Accuracy](output/1_accuracy.png) | ![Example](output/2_example_item.png) |
+
+![SHAP feature impact](output/4_shap.png)
 
 ## Method
 1. **Data:** daily unit sales were rolled up to Walmart weeks for the 50 highest-volume `FOODS_3` items at store `CA_1`, from 2013 to 2016. Weekly price, SNAP benefit days and event days were joined on.
@@ -23,13 +26,27 @@ Scope: 50 top-selling food SKUs at Walmart store CA_1. Backtested on the last 26
    - **Moving average:** the last 4 weeks.
    - **Seasonal naive:** the same week last year.
    - **LightGBM:** one global model for all items, using lag, rolling and price features, plus SNAP days, events, week of year and item.
-   - The LightGBM loss function (L1) was chosen on a separate 13-week validation window, not on the test set.
+   - LightGBM settings were tuned without touching the test set (see Model development).
 3. **Inventory policy:**
    - Weekly review with 1-week lead time, using an order-up-to level: `S = 2 × forecast + safety stock`.
    - Safety stock is calculated as `z × σ(forecast error) × √2`. The error spread σ is measured on the validation weeks.
    - Service targets follow **ABC classes**, based on each item's share of revenue: A = 98% (26 items), B = 95% (15), C = 90% (9).
 4. **Simulation:** each method's policy is replayed week by week on the real test demand. Unmet demand counts as a lost sale. To compare methods fairly, safety stock is scaled from 0× to 2.5×, which traces the fill-rate vs inventory curve above. The methods are then compared at the same 98% fill rate.
 5. **Self-checks** in the code: every method forecasts every test week, fill rates stay between 0 and 1, there's no negative stock, and every item has an ABC class.
+
+## Model development
+- **Rolling-origin cross-validation** (`tune.py`): 4 folds before the test period. Each fold trains on all earlier weeks and validates on the next 13, the way the model is used in practice. A random split would leak future weeks into training.
+- **Hyperparameter search with Optuna**: 50 trials over loss function, tree size, learning rate, sampling and regularisation, scored by mean cross-validated WAPE.
+
+  | Model (cross-validated, 4 folds) | Mean WAPE |
+  |---|---|
+  | Naive | 24.1% |
+  | 4-week moving average | 29.2% |
+  | LightGBM, default settings | 23.0% |
+  | **LightGBM, tuned** | **22.5%** |
+
+- **Experiment tracking with MLflow**: every trial's parameters and fold scores, and every test backtest with its charts, are logged to `mlflow.db`. Browse them with `mlflow ui --backend-store-uri sqlite:///mlflow.db`.
+- **Explainability with SHAP**: LightGBM's built-in TreeSHAP splits each test prediction into per-feature contributions. A self-check confirms the contributions add back up to the prediction.
 
 ## Outputs
 | File | Contents |
@@ -38,7 +55,8 @@ Scope: 50 top-selling food SKUs at Walmart store CA_1. Backtested on the last 26
 | `output/inventory_summary.csv` | Fill rate, inventory, safety stock and stockouts by method |
 | `output/tradeoff_curve.csv` | Points on the curve in the chart |
 | `output/reorder_plan.csv` | **Per-SKU safety stock and order-up-to level**, i.e. what a planner would use |
-| `output/feature_importance.csv` | LightGBM feature importance |
+| `output/shap_importance.csv` | Average SHAP impact per feature, in units per week |
+| `output/best_params.json` | Tuned LightGBM settings from `tune.py` |
 
 ## Limitations
 - **Sales are not the same as demand.** 9% of item-weeks show zero sales, including multi-week gaps for items that normally sell hundreds a week (16 of the 25 items that average 100+ units a week). These gaps are most likely stockouts, so real demand is understated. A next step would be to flag these weeks and exclude them from training.
@@ -49,6 +67,7 @@ Scope: 50 top-selling food SKUs at Walmart store CA_1. Backtested on the last 26
 ```bash
 pip install -r requirements.txt
 # download m5.zip (https://github.com/Nixtla/m5-forecasts/raw/main/datasets/m5.zip) and unzip into data/raw/
-python forecast.py
+python tune.py       # optional, about 5 min: cross-validation + Optuna, writes output/best_params.json
+python forecast.py   # backtest, inventory simulation, SHAP, logs to MLflow
 ```
-The first run builds `data/weekly.csv` (about 1 min). Later runs reuse it.
+The first run builds `data/weekly.csv` (about 1 min). Later runs reuse it. Tested on Python 3.14 (Optuna and MLflow don't install on 3.15 yet).

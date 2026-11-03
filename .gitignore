@@ -1,3 +1,6 @@
 data/raw/
 __pycache__/
 *.pbix.bak
+.venv/
+mlflow.db
+mlruns/

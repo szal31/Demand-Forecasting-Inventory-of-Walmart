@@ -6,6 +6,7 @@
 
 Usage:  python forecast.py
 """
+import json
 from pathlib import Path
 
 import lightgbm as lgb
@@ -78,12 +79,18 @@ FEATURES = ["lag_1", "lag_2", "lag_3", "lag_4", "lag_52", "mean_4", "mean_13", "
 
 
 # ---------- 2. forecasts ----------
-def lightgbm_forecast(df, train_end, pred_mask):
+DEFAULT_PARAMS = dict(objective="regression_l1", n_estimators=400, learning_rate=0.03, num_leaves=31,
+                      min_child_samples=20, subsample=0.8, subsample_freq=1, colsample_bytree=0.8)
+BEST_PARAMS = OUT / "best_params.json"  # written by tune.py; tuning never sees the test weeks
+
+
+def lgb_params():
+    return {**DEFAULT_PARAMS, **json.loads(BEST_PARAMS.read_text())} if BEST_PARAMS.exists() else DEFAULT_PARAMS
+
+
+def lightgbm_forecast(df, train_end, pred_mask, params=None):
     train = df[(df.week_start < train_end)].dropna(subset=["lag_52"])
-    # L1 objective picked on validation weeks (WAPE 19.9% vs 20.5% tweedie, 21.3% L2); test weeks never used for tuning
-    model = lgb.LGBMRegressor(objective="regression_l1", n_estimators=400, learning_rate=0.03,
-                              num_leaves=31, min_child_samples=20, subsample=0.8, subsample_freq=1,
-                              colsample_bytree=0.8, random_state=42, verbose=-1)
+    model = lgb.LGBMRegressor(**(params or lgb_params()), random_state=42, verbose=-1)
     model.fit(train[FEATURES], train["units"])
     return model.predict(df.loc[pred_mask, FEATURES]).clip(0), model
 
@@ -246,6 +253,50 @@ def charts(df, acc, curve):
     save(fig, "3_inventory_tradeoff.png")
 
 
+def shap_importance(model, test):
+    """Mean |SHAP value| per feature on the test weeks, in units sold (LightGBM's built-in TreeSHAP)."""
+    contrib = model.predict(test[FEATURES], pred_contrib=True)  # last column is the base value
+    # Self-check: SHAP values plus base value must add back up to the raw prediction.
+    assert np.allclose(contrib.sum(axis=1), model.predict(test[FEATURES]), atol=1e-3)
+    return pd.Series(np.abs(contrib[:, :-1]).mean(axis=0), FEATURES).sort_values(ascending=False)
+
+
+FEATURE_LABELS = {
+    "lag_1": "Sales last week", "lag_2": "Sales 2 weeks ago", "lag_3": "Sales 3 weeks ago",
+    "lag_4": "Sales 4 weeks ago", "lag_52": "Sales same week last year", "mean_4": "4-week average",
+    "mean_13": "13-week average", "std_13": "13-week volatility", "item": "Which product",
+    "snap_days": "SNAP benefit days", "week_of_year": "Week of year", "event_days": "Holiday/event days",
+    "price_ratio": "Price vs recent price", "sell_price": "Price",
+}
+
+
+def shap_chart(impact):
+    fig, ax = plt.subplots(figsize=(8, 4.2), dpi=150)
+    fig.patch.set_facecolor(SURFACE)
+    style(ax, "What drives the forecast: average impact per feature (units/week, SHAP)")
+    s = impact.iloc[::-1].rename(FEATURE_LABELS)
+    bars = ax.barh(s.index, s.values, height=0.6, color=BLUE)
+    for b, v in zip(bars, s.values):
+        ax.text(b.get_width() + s.max() * 0.01, b.get_y() + b.get_height() / 2, f"{v:.1f}", va="center",
+                fontsize=8, color=MUTED)
+    ax.xaxis.set_visible(False)
+    save(fig, "4_shap.png")
+
+
+def log_run(acc, needed):
+    import mlflow  # imported here so the forecast itself runs without MLflow installed
+    mlflow.set_tracking_uri(f"sqlite:///{(ROOT / 'mlflow.db').as_posix()}")
+    mlflow.set_experiment("demand-forecasting")
+    with mlflow.start_run(run_name="test-backtest"):
+        mlflow.log_params({**lgb_params(), "tuned": BEST_PARAMS.exists(), "test_weeks": TEST_WEEKS})
+        for m in METHODS:
+            key = m.lower().replace(" ", "_").replace("(", "").replace(")", "")
+            mlflow.log_metric(f"test_wape_{key}", float(acc.loc[m, "WAPE"]))
+            mlflow.log_metric(f"inventory_at_98_fill_{key}", float(needed[m]))
+        for chart in OUT.glob("*.png"):
+            mlflow.log_artifact(str(chart))
+
+
 def main():
     OUT.mkdir(exist_ok=True)
     df = add_features(build_weekly())
@@ -273,10 +324,12 @@ def main():
     plan[["item_id", "abc", "safety_stock", "reorder_up_to", "fill_rate"]].round(
         {"safety_stock": 0, "reorder_up_to": 0, "fill_rate": 3}) \
         .sort_values(["abc", "item_id"]).to_csv(OUT / "reorder_plan.csv", index=False)
-    pd.Series(model.feature_importances_, FEATURES).sort_values(ascending=False) \
-        .to_csv(OUT / "feature_importance.csv", header=["importance"])
+    impact = shap_importance(model, test)
+    impact.to_csv(OUT / "shap_importance.csv", header=["mean_abs_shap_units"])
     curve.to_csv(OUT / "tradeoff_curve.csv", index=False)
     charts(df, acc, curve)
+    shap_chart(impact)
+    log_run(acc, needed)
 
     print(f"{N_ITEMS} items, {pd.Timestamp(weeks.min()):%d %b %Y} to {pd.Timestamp(weeks.max()):%d %b %Y}; "
           f"test = last {TEST_WEEKS} weeks from {pd.Timestamp(weeks[-TEST_WEEKS]):%d %b %Y}")

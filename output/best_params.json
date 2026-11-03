@@ -1,0 +1,11 @@
+{
+  "objective": "regression_l1",
+  "n_estimators": 500,
+  "learning_rate": 0.015459266515729757,
+  "num_leaves": 8,
+  "min_child_samples": 21,
+  "subsample": 0.7556256955253021,
+  "colsample_bytree": 0.9843343533556946,
+  "reg_lambda": 1.4960606898355613,
+  "subsample_freq": 1
+}
